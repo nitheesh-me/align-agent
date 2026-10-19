@@ -120,15 +120,22 @@ def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
     """Shell text with heredoc bodies removed, and the bodies in the order
     their `<<` operators appear. Every heredoc is removed, not only the first:
     lines of a second body otherwise read as commands."""
+    shell, bodies, _ = _split_heredocs(cmd)
+    return shell, bodies
+
+
+def _split_heredocs(cmd: str) -> Tuple[str, List[str], List[bool]]:
+    """split_heredocs, plus for each body whether the shell expands `$` and
+    backticks in it (its delimiter was not quoted)."""
     lines = (cmd or "").split("\n")
-    out, bodies, i = [], [], 0
+    out, bodies, expands, i = [], [], [], 0
     quote = ""  # the quote open at the end of the previous line: `python -c "..."` spans lines
     while i < len(lines):
         line = lines[i]
         out.append(line)
         i += 1
         ops, quote = _heredoc_ops(line, quote)
-        for strip_tabs, delim in ops:
+        for strip_tabs, delim, quoted in ops:
             body = []
             # bash ends a body only at a line that is exactly the delimiter (`<<-`: after tabs)
             while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]).rstrip("\r") != delim:
@@ -136,12 +143,13 @@ def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
                 i += 1
             i += 1
             bodies.append("\n".join(body))
-    return "\n".join(out), bodies
+            expands.append(not quoted)
+    return "\n".join(out), bodies, expands
 
 
-def _heredoc_ops(line: str, quote: str) -> Tuple[List[Tuple[bool, str]], str]:
+def _heredoc_ops(line: str, quote: str) -> Tuple[List[Tuple[bool, str, bool]], str]:
     """The `<<` / `<<-` operators of one line that are outside quotes, as
-    (strips tabs, delimiter), and the quote still open at its end. A `<<`
+    (strips tabs, delimiter, delimiter quoted), and the quote still open at its end. A `<<`
     inside a grep pattern or a python -c string is text, not a heredoc."""
     ops, k = [], 0
     while k < len(line):
@@ -161,7 +169,7 @@ def _heredoc_ops(line: str, quote: str) -> Tuple[List[Tuple[bool, str]], str]:
         elif line.startswith("<<", k):
             m = _HEREDOC_OP_RE.match(line, k)
             if m:
-                ops.append((m.group(1) == "-", m.group(3)))
+                ops.append((m.group(1) == "-", m.group(3), bool(m.group(2))))
                 k = m.end() - 1
         k += 1
     return ops, quote
@@ -174,7 +182,7 @@ def command_units(cmd: str) -> List[Dict]:
     Tokenising respects quoting, so a `>` inside a grep pattern is part of
     the pattern and not a redirection; newlines separate commands as `;`
     does."""
-    shell, bodies = split_heredocs(cmd)
+    shell, bodies, expands = _split_heredocs(cmd)
     # A backslash-newline continues a line; join before tokenising.
     shell = shell.replace("\\\n", " ")
     try:
@@ -192,13 +200,15 @@ def command_units(cmd: str) -> List[Dict]:
     pending: Optional[str] = None
 
     def new() -> Dict:
-        return {"argv": [], "redirs": [], "heredoc": None, "pipe": pipe, "depth": depth}
+        return {"argv": [], "redirs": [], "heredoc": None, "heredoc_expands": False, "pipe": pipe, "depth": depth}
 
     cur = new()
     for t in tokens:
         if pending is not None:
             if pending.startswith("<<") and pending != "<<<":
                 cur["heredoc"] = bodies[body_i] if body_i < len(bodies) else ""
+                cur["heredoc_expands"] = (body_i < len(expands) and expands[body_i]
+                                          and bool(re.search(r"[$`]", cur["heredoc"])))
                 body_i += 1
             else:
                 cur["redirs"].append((pending, t))
@@ -513,7 +523,7 @@ def _unit_events(u: Dict, literal_pipe: bool) -> List[FileEvent]:
     verb = argv[0].split("/")[-1] if argv else ""
     flags = [a for a in argv[1:] if a.startswith("-")]
     ops = [a for a in argv[1:] if not a.startswith("-")]
-    literal = literal_pipe or (verb == "cat" and u["heredoc"] is not None)
+    literal = literal_pipe
     handler = _HANDLERS.get(verb) or (_interpreter if verb.startswith(_INTERPRETERS) else None)
     reads, writes = handler(argv, flags, ops, u, literal) if handler else ([], [])
 
@@ -644,11 +654,7 @@ def _events_with_verbs(cmd: str, cwd: Optional[str] = None,
     heredoc) to their text, and is updated in place: running one of them
     writes the files its text writes."""
     units = command_units(cmd)
-    literal_pipes = set()
-    for u in units:
-        first = u["argv"][0].split("/")[-1] if u["argv"] else ""
-        if first in _LITERAL_SOURCES or (first == "cat" and u["heredoc"] is not None):
-            literal_pipes.add(u["pipe"])
+    literal = literal_units(units)
     swallowed = _swallowed_pipes(units)
     # The last unit of each pipeline whose output goes to a file: what it and
     # every unit before it in the pipeline read never reaches the terminal.
@@ -678,7 +684,7 @@ def _events_with_verbs(cmd: str, cwd: Optional[str] = None,
                     if op.lstrip("0123456789") in (">", ">|") and clean(target).endswith(_SCRIPT_SUFFIXES):
                         scripts[resolve_path(here, clean(target))] = u["heredoc"]
                         composed.add(resolve_path(here, clean(target)))
-        for op, p, kind in _unit_events(u, u["pipe"] in literal_pipes):
+        for op, p, kind in _unit_events(u, i in literal):
             p = resolve_path(here, p)
             kind = map_kind_path(kind, lambda x: resolve_path(here, x))
             # Content piped into wc or a digest never reaches the agent.
@@ -687,6 +693,33 @@ def _events_with_verbs(cmd: str, cwd: Optional[str] = None,
             if op == "R" and captured.get(u["pipe"], -1) >= i:
                 continue
             out.append((op, p, kind, verb))
+    return out
+
+
+_PASS_THROUGH = {"cat", "tee"}
+
+
+def literal_units(units: List[Dict]) -> set:
+    """Indexes of the units whose output is text the agent typed in this very
+    command: echo/printf with nothing the shell expands, a heredoc the shell
+    does not expand, and `cat`/`tee` passing such text on. A program in the
+    pipeline (`echo x | python gen.py > a.py`) makes its output its own."""
+    out, last = set(), {}
+    for i, u in enumerate(units):
+        argv = _strip_prefixes(u["argv"])
+        verb = argv[0].split("/")[-1] if argv else ""
+        operands = [a for a in argv[1:] if not a.startswith("-")]
+        if verb in _LITERAL_SOURCES and u["heredoc"] is None:
+            ok = not any(re.search(r"[$`]", a) for a in argv[1:])
+        elif verb == "cat" and u["heredoc"] is not None:
+            ok = not operands and not u.get("heredoc_expands")
+        elif verb in _PASS_THROUGH and (verb == "tee" or not operands):
+            ok = last.get(u["pipe"]) is True  # passes on what came in, if that was literal
+        else:
+            ok = False
+        last[u["pipe"]] = ok
+        if ok:
+            out.add(i)
     return out
 
 

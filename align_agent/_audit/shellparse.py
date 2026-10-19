@@ -45,8 +45,14 @@ WRAPPERS = {"sudo", "command", "exec", "nohup", "time", "env", "xargs", "nice", 
 
 def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
     """Remove heredoc bodies; replace each operator by a placeholder word."""
+    shell, bodies, _ = _split_heredocs(cmd)
+    return shell, bodies
+
+
+def _split_heredocs(cmd: str) -> Tuple[str, List[str], List[bool]]:
+    """split_heredocs, plus for each body whether the shell expands it (delimiter not quoted)."""
     lines = (cmd or "").split("\n")
-    out, bodies, i = [], [], 0
+    out, bodies, expands, i = [], [], [], 0
     while i < len(lines):
         line = lines[i]
         i += 1
@@ -62,6 +68,7 @@ def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
         for m in ops:
             strip_tabs = m.group(1) == "-"
             delim = m.group(4)
+            expands.append(not (m.group(2) or m.group(3)))
             body = []
             while i < len(lines):
                 ln = lines[i]
@@ -72,7 +79,7 @@ def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
                 body.append(ln)
                 i += 1
             bodies.append("\n".join(body))
-    return "\n".join(out), bodies
+    return "\n".join(out), bodies, expands
 
 
 def mask_heredocs(cmd: str) -> str:
@@ -125,7 +132,7 @@ def tokenize(shell: str) -> List[str]:
 def simple_commands(cmd: str) -> List[Dict]:
     """Simple commands with argv, redirections, stdin heredoc body, pipeline
     membership and the connector that precedes each one."""
-    shell, bodies = split_heredocs(cmd)
+    shell, bodies, expands = _split_heredocs(cmd)
     toks = tokenize(shell)
     if not toks and shell.strip():
         # Unbalanced quoting somewhere: tokenise line by line and keep the
@@ -152,6 +159,7 @@ def simple_commands(cmd: str) -> List[Dict]:
         if m:
             k = int(m.group(1))
             cur["heredoc"] = bodies[k] if k < len(bodies) else ""
+            cur["heredoc_expands"] = k < len(expands) and expands[k] and bool(re.search(r"[$`]", cur["heredoc"]))
             continue
         if pending is not None:
             cur["redirs"].append((pending, t))
@@ -731,13 +739,24 @@ def extract(cmd: str, cwd: str, known_files: Optional[Dict[str, str]] = None,
                 return True
         return False
 
-    literal_pipes = set()
-    for u in units:
+    # literal per unit: text typed in this command, or cat/tee passing it on; a program in the
+    # pipeline (`echo x | python gen.py > a.py`) makes its output its own
+    literal_units, last = set(), {}
+    for ui, u in enumerate(units):
         argv = strip_prefixes(u["argv"])
         verb = argv[0].split("/")[-1] if argv else ""
-        if verb in LITERAL_SOURCES or (verb == "cat" and u["heredoc"] is not None and
-                                       not [a for a in argv[1:] if not a.startswith("-")]):
-            literal_pipes.add(u["pipe"])
+        operands = [a for a in argv[1:] if not a.startswith("-")]
+        if verb in LITERAL_SOURCES and u["heredoc"] is None:
+            ok = not any(re.search(r"[$`]", a) for a in argv[1:])
+        elif verb == "cat" and u["heredoc"] is not None:
+            ok = not operands and not u.get("heredoc_expands")
+        elif verb in ("cat", "tee") and (verb == "tee" or not operands):
+            ok = last.get(u["pipe"]) is True
+        else:
+            ok = False
+        last[u["pipe"]] = ok
+        if ok:
+            literal_units.add(ui)
 
     for ui, u in enumerate(units):
         if u.get("paren"):
@@ -750,7 +769,7 @@ def extract(cmd: str, cwd: str, known_files: Optional[Dict[str, str]] = None,
         verb = argv[0].split("/")[-1] if argv else ""
         info["verbs"].append(verb)
         guard = u["guard"]
-        literal = u["pipe"] in literal_pipes
+        literal = ui in literal_units
         new_ops: List[Dict] = []
         operands = [a for a in argv[1:] if not a.startswith("-")]
 

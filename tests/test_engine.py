@@ -6,6 +6,7 @@ Each test drives align_wt as the Claude Code plugin ships it, in a throwaway git
 import json
 import ntpath
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -116,7 +117,8 @@ def test_large_lockfile_change_is_fast():
         w.start()
         with w.session() as s:
             s.read("package-lock.json")
-        w.write("package-lock.json", open(os.path.join(w.root, "package-lock.json")).read().replace("1.0.0", "2.0.0", 40))
+        with open(os.path.join(w.root, "package-lock.json")) as f:
+            w.write("package-lock.json", f.read().replace("1.0.0", "2.0.0", 40))
         t = time.monotonic()
         with w.session() as s:
             out = s.after("npm install", "")
@@ -352,7 +354,8 @@ def test_hooks_read_utf8_stdin_under_any_locale():
         hook = os.path.join(SCRIPTS, "hook.py")
         subprocess.run([sys.executable, "-I", hook], input=json.dumps(payload, ensure_ascii=False).encode(), env=env, check=True)
         sessions = os.path.join(w.state, "sessions", "s", "ledger.json")
-        assert "café.py" in json.load(open(sessions, encoding="utf-8"))
+        with open(sessions, encoding="utf-8") as f:
+            assert "café.py" in json.load(f)
     finally:
         w.close()
 
@@ -362,6 +365,73 @@ def test_protocol_fails_open():
                         "from align_wt.protocol import main; sys.exit(main())"],
                        input=b'{"event": "read"}', capture_output=True, env=dict(os.environ, ALIGN_STATE=tempfile.mkdtemp()))
     assert r.returncode == 0 and r.stdout == b""
+
+
+
+# ---------------------------------------------------------------- guard addresses, literal writes, locking
+
+def test_sed_addresses_beyond_n_and_n_m():
+    w = Workspace({"a.py": lines(40)})
+    try:
+        assert [(lo, hi) for _, lo, hi, _ in E.sed_line_edits("sed -i '3,+2d;10~2d;0~4d;5{N;d};7,$d' a.py", w.root)] == \
+            [(3, 5), (10, None), (4, None), (5, 6), (7, None)]
+        w.start()
+        with w.session() as s:
+            s.read("a.py", 1, 10)
+        with w.session() as s:
+            assert s.before("sed -i '3,+2d' a.py") is None  # lines 3-5: seen
+            assert s.before("sed -i '8,$d' a.py")  # to the end: lines 11-40 not seen
+    finally:
+        w.close()
+
+
+def test_guard_sees_find_exec_xargs_and_gawk_options():
+    w = Workspace({"a.py": lines(40)})
+    try:
+        edits = lambda c: [(f, lo, hi) for f, lo, hi, _ in E.sed_line_edits(c, w.root) + E.script_line_edits(c, w.root)]
+        assert edits("find a.py -exec sed -i '30d' {} +") == [("a.py", 30, 30)]
+        assert edits("find . -name a.py -exec sed -i '30d' {} \\;") == []  # which files: unknown
+        assert edits("git ls-files | xargs sed -i '30d'") == []
+        assert edits("xargs -I{} sed -i '30d' {} a.py < list") == [("a.py", 30, 30)]
+        assert edits("gawk -i inplace -v n=1 'NR==30{next}1' a.py") == [("a.py", 30, 30)]
+        assert edits("gawk -i inplace -f prog.awk a.py") == []
+    finally:
+        w.close()
+
+
+def test_write_is_literal_only_for_text_typed_in_the_command():
+    from wt_src.parsers.file_events import shell_file_events
+    kinds = lambda c: [k for op, _, k in shell_file_events(c) if op == "W"]
+    assert kinds("echo hi > a.py") == ["overwrite"]
+    assert kinds("echo hi | python gen.py > a.py") == ["replace"]  # gen.py's output, not the echo
+    assert kinds('echo "$(cat b.py)" > a.py') == ["replace"]
+    assert kinds("cat > a.py <<EOF\nx = $y\nEOF") == ["replace"]  # the shell expands $y
+    assert kinds("cat > a.py <<'EOF'\nx = $y\nEOF") == ["overwrite"]
+    assert kinds("echo x | tee a.py") == ["overwrite"]
+
+
+def test_failed_save_still_releases_the_lock():
+    w = Workspace({"a.py": "x\n"})
+    try:
+        s = w.session()
+        lock = s.state._lock
+        try:
+            with s:
+                s.state.ledger = {"a.py": {"sha": object()}}  # not JSON: save fails
+        except TypeError:
+            pass
+        assert lock.closed
+        with w.session() as s2:  # not left locked
+            s2.start()
+    finally:
+        w.close()
+
+
+def test_windows_lock_wait_stays_inside_hook_timeout():
+    import inspect
+    src = inspect.getsource(E.lock_file)
+    tries = int(re.search(r"range\((\d+)\)", src).group(1))
+    assert tries * 0.1 <= 25
 
 
 if __name__ == "__main__":

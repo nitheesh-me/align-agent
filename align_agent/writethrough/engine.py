@@ -84,7 +84,7 @@ def lock_file(f):
         fcntl.flock(f, fcntl.LOCK_EX)
         return
     f.seek(0)
-    for _ in range(600):  # msvcrt.locking does not wait; retry for up to a minute
+    for _ in range(200):  # msvcrt.locking does not wait; retry for 20 s, inside the hook's 30 s
         try:
             msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
             return
@@ -116,7 +116,11 @@ class State:
         os.makedirs(os.path.join(self.dir, "blobs"), mode=0o700, exist_ok=True)
         prune_sessions(sessions, keep=self.dir)
         self._lock = open(os.path.join(self.dir, ".lock"), "a+")
-        lock_file(self._lock)  # parallel tool calls run their hooks in parallel
+        try:
+            lock_file(self._lock)  # parallel tool calls run their hooks in parallel
+        except BaseException:
+            self._lock.close()  # still locked by another call: the adapter logs it and lets the tool run
+            raise
         self.snapshot = self._load("snapshot.json", None)
         self.ledger = self._load("ledger.json", {})
         self.written = set(self._load("written.json", []))
@@ -136,7 +140,15 @@ class State:
                 json.dump(obj, f)
             os.replace(tmp, os.path.join(self.dir, name))
         self.drop_unused_blobs()
-        unlock_file(self._lock)
+
+    def release(self):
+        """Unlock and close the session lock; safe to call more than once."""
+        if self._lock.closed:
+            return
+        try:
+            unlock_file(self._lock)
+        finally:
+            self._lock.close()
 
     def drop_unused_blobs(self):
         """Delete stored file copies the ledger no longer points to (old versions, cleared views)."""
@@ -512,7 +524,73 @@ def shell_reads(root, command, output, base=None):
 
 # ---------------------------------------------------------------- guard
 
-SED_LINE = re.compile(r"^\s*(\d+)\s*(?:,\s*(\d+|\$)\s*)?!?\s*([acdisyrR])")
+# N, N,M  N,$  N,+M  N,~M  N~step, then the command (or a `{` block)
+SED_LINE = re.compile(r"^\s*(\d+)\s*(?:,\s*(\d+|\$|\+\d+|~\d+)|~\s*(\d+))?\s*!?\s*([acdisyrR{])")
+XARGS_VALUE = {"-I", "-i", "-n", "-L", "-l", "-P", "-d", "-E", "-e", "-s", "-a", "--max-args", "--max-procs",
+               "--delimiter", "--arg-file", "--replace"}
+
+
+def _sed_commands(script):
+    """A sed script's commands, split at `;` and newlines outside `{ }` blocks."""
+    out, cur, depth = [], "", 0
+    for c in script:
+        if c in ";\n" and depth == 0:
+            out.append(cur)
+            cur = ""
+            continue
+        depth += (c == "{") - (c == "}")
+        cur += c
+    return out + [cur]
+
+
+def _sed_range(cmd):
+    """(first line, last line or None for the end of the file) a sed command addresses by number."""
+    m = SED_LINE.match(cmd)
+    if not m:
+        return None
+    lo, to, step = int(m.group(1)), m.group(2), m.group(3)
+    if step is not None:  # first~step: every step-th line from the first (0~4: line 4) to the end
+        step = int(step)
+        return (lo or step, None) if step else (lo, lo)
+    if to is None:
+        hi = lo
+    elif to == "$":
+        return lo, None
+    elif to.startswith("+"):
+        hi = lo + int(to[1:])
+    elif to.startswith("~"):  # up to the next multiple of M
+        k = int(to[1:])
+        hi = -(-lo // k) * k if k else lo
+    else:
+        hi = max(lo, int(to))
+    if m.group(4) == "{":  # each `N` in the block pulls in one more line
+        hi += len(re.findall(r"(?:^|[;{\s])N(?=\s*(?:[;}]|$))", cmd[m.end():]))
+    return lo, hi
+
+
+def _unwrap(words, d):
+    """The command `find ... -exec CMD {} +` or `xargs CMD` runs, as words, with `{}` replaced by
+    the one file find names (when it names a file) and dropped otherwise: files from stdin are unknown."""
+    tool = os.path.basename(words[0]) if words else ""
+    target = None
+    if tool == "find":
+        k = next((i for i, w in enumerate(words) if w in ("-exec", "-execdir", "-ok", "-okdir")), None)
+        if k is None:
+            return words
+        paths = [w for w in words[1:k] if not w.startswith(("-", "(", "!"))]
+        paths = paths[:next((i for i, w in enumerate(words[1:k]) if w.startswith(("-", "(", "!"))), len(paths))]
+        if len(paths) == 1 and d is not None and os.path.isfile(os.path.join(d, paths[0])):
+            target = paths[0]
+        words = words[k + 1:]
+        words = words[:next((i for i, w in enumerate(words) if w in (";", "+")), len(words))]
+    elif tool == "xargs":
+        i = 1
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in XARGS_VALUE else 1
+        words = words[i:]
+    else:
+        return words
+    return [target if w == "{}" else w for w in words if w != "{}" or target]
 
 
 def sed_line_edits(command, base=""):
@@ -521,6 +599,7 @@ def sed_line_edits(command, base=""):
     for words, u, d, _ in placed_units(command, base):
         while words and (words[0] in ("sudo", "command") or "=" in words[0]):
             words = words[1:]
+        words = _unwrap(words, d)
         if not words or os.path.basename(words[0]) not in ("sed", "gsed"):
             continue
         inplace, scripts, files, explicit, i = False, [], [], "-e" in words or "--expression" in words, 1
@@ -543,13 +622,10 @@ def sed_line_edits(command, base=""):
         if not inplace:
             continue
         for script in scripts:
-            for cmd in re.split(r"[;\n]", script):
-                m = SED_LINE.match(cmd)
-                if not m:
-                    continue
-                lo = int(m.group(1))
-                hi = lo if not m.group(2) or m.group(2) == "$" else int(m.group(2))
-                out += [(f, lo, max(lo, hi), d) for f in files]
+            for cmd in _sed_commands(script):
+                r = _sed_range(cmd)
+                if r:
+                    out += [(f, r[0], r[1], d) for f in files]
     return out
 
 
@@ -585,6 +661,7 @@ def script_line_edits(command, base=""):
     for words, u, d, _ in placed_units(command, base):
         while words and (words[0] in ("sudo", "command") or "=" in words[0]):
             words = words[1:]
+        words = _unwrap(words, d)
         if not words:
             continue
         tool = os.path.basename(words[0])
@@ -594,9 +671,25 @@ def script_line_edits(command, base=""):
             r = _bounds(PERL_LINE.findall(code))
             files = [w for w in words[1:] if not w.startswith("-") and w != code and w not in code]
         elif tool in ("awk", "gawk") and "inplace" in words:
-            prog = next((w for w in words[1:] if not w.startswith("-") and w != "inplace"), "")
-            r = _bounds(AWK_LINE.findall(prog))
-            files = [w for w in words[words.index(prog) + 1:] if not w.startswith("-")] if prog else []
+            prog, files, i = None, [], 1
+            while i < len(words):
+                w = words[i]
+                if w in ("-v", "-i", "-l", "-F", "--assign", "--include", "--load", "--field-separator"):
+                    i += 2  # the option's value: a variable, `inplace`, a separator
+                    continue
+                if w in ("-f", "--file"):
+                    prog, i = prog or "", i + 2  # the program is in a file: its lines are unknown
+                    continue
+                if w in ("-e", "--source") and i + 1 < len(words):
+                    prog, i = (prog or "") + words[i + 1] + "\n", i + 2
+                    continue
+                if not w.startswith("-"):
+                    if prog is None:
+                        prog = w
+                    elif not re.match(r"^[A-Za-z_]\w*=", w):  # `var=value` operands are assignments
+                        files.append(w)
+                i += 1
+            r = _bounds(AWK_LINE.findall(prog or ""))
         elif tool in ("ed", "ex") or (tool in ("vim", "vi") and "-es" in words):
             # the script comes inline: printf '...' | ed f, ed f <<< $'...', ex -sc '...' f
             pieces = re.split(r"\\n|\n|\||;", command)
@@ -633,9 +726,10 @@ def guard(state, root, command, base=None):
             continue
         sha = hashlib.sha256(text.encode("utf-8", "surrogateescape")).hexdigest()
         known = entry.get("regions") or [] if entry["sha"] == sha else []
+        lines = split_lines(text)
+        hi = max(lo, len(lines)) if hi is None else hi  # `N,$`, `N~step`: to the end of the file
         if covered(known, lo, hi):
             continue
-        lines = split_lines(text)
         a, b = max(1, lo - 5), min(len(lines), hi + 5, lo + 80)
         body = "\n".join(f"{k:6d}\t{lines[k - 1]}" for k in range(a, b + 1))
         see(state, root, rel, [[a, b]])  # the refusal shows them: a retry with these numbers passes
@@ -665,13 +759,20 @@ class Session:
         if self.state.snapshot is None:
             # no session-start hook (Cline) or the first call after install: changes are
             # counted from now on
-            self.state.snapshot = scan(self.root)
+            try:
+                self.state.snapshot = scan(self.root)
+            except BaseException:
+                self.state.release()
+                raise
 
     def __enter__(self):
         return self
 
     def __exit__(self, *exc):
-        self.state.save()
+        try:
+            self.state.save()
+        finally:
+            self.state.release()  # a failed save must not leave the session locked
         return False
 
     def _base(self, cwd):

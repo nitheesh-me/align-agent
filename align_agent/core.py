@@ -122,27 +122,87 @@ def _load_session(path, fmt, cwd):
     return t, fmt, dict(cov)
 
 
+OTHER_WRITERS = _sess.OTHER_WRITERS
+
+
+def writer_of(op):
+    """'self' for the agent's own write, 'other' for one another agent (parent, subagent, sibling) made."""
+    return "other" if str(op.get("mech") or "").startswith(OTHER_WRITERS) else "self"
+
+
 def analyze(t):
     """Opportunities, stale edits and their classes for one loaded trajectory."""
     r = Replay(t).run()
     steps = t["steps"]
     stale = []
+    hazard_at = {(h["step"], h["op"]) for h in r.hazards}
+    # Claude Code's own verdicts on edits the replay scored: stale (refused, or applied with a note)
+    oracle = Counter()
+    for o in r.opps:
+        flag = steps[o["step"]]["ops"][o["op"]].get("harness")
+        if flag:
+            oracle[flag] += 1
+            oracle[flag + (":flagged" if (o["step"], o["op"]) in hazard_at else ":missed")] += 1
     for h in r.hazards:
         cls, why, _ = classify(h, t)
         lv = h.get("last_view")
         e = steps[h["step"]]
+        wops = [steps[w[0]]["ops"][w[1]] for w in h.get("W") or [] if 0 <= w[1] < len(steps[w[0]]["ops"])]
+        writers = sorted({writer_of(o) for o in wops}) or ["self"]
         stale.append({
             "step": h["step"], "path": h["path"], "mechanism": h.get("mech"),
             "held_view_step": lv[0] if lv else None,
             "view_channel": ("shell" if (steps[lv[0]].get("tool") or "shell") == "shell" else "tool") if lv else None,
             "unseen_writes": [w[0] for w in h.get("W") or []],
+            # whose writes made the view stale: only the agent's own (it did not re-read after them), or
+            # at least one write by another agent
+            "writer": "other" if "other" in writers else "self",
             "class": cls, "reason": why,
             "went_wrong": cls.startswith("MATERIALIZED"),
             "command": (e.get("action") or "")[:400],
         })
     return {"trajectory": t["traj_id"], "agent": t["agent"], "model": t.get("model") or "", "steps": len(steps),
-            "anchored_edits": sum(1 for s in steps for o in s["ops"] if o["op"] == "W" and o.get("kind") == "anchored"),
+            "session": t.get("session"), "harness_oracle": dict(oracle),
+            "anchored_edits": sum(1 for s in steps for o in s["ops"] if o["op"] == "W" and o.get("kind") == "anchored"
+                                  and not o.get("no_score")),
             "opportunities": len(r.opps), "stale_edits": len(stale), "stale": stale}
+
+
+def session_key(r):
+    """The session a result belongs to (a session's subagent transcripts share it)."""
+    f = r.get("file")
+    if f and r.get("format") == "claudecode":
+        return os.path.abspath(_sess.session_file(f))
+    return f or r.get("session") or r["trajectory"]  # a Codex rollout is one session
+
+
+MIN_CLUSTERS = 10  # fewer sessions than this: too few to resample, the binomial interval is given instead
+
+
+def cluster_ci(results, a=0.05, reps=2000, seed=0):
+    """Percentile bootstrap of the pooled stale rate, resampling whole sessions: the edits of one
+    session are not independent trials. Deterministic (fixed seed), standard library only. With fewer
+    than MIN_CLUSTERS sessions, the Clopper-Pearson interval of the pooled counts."""
+    import random
+    groups = {}
+    for r in results:
+        s, o = groups.get(session_key(r), (0, 0))
+        groups[session_key(r)] = (s + r["stale_edits"], o + r["opportunities"])
+    cells = [v for v in groups.values() if v[1]]
+    if not cells:
+        return (None, None)
+    if len(cells) < MIN_CLUSTERS:
+        return cp_ci(sum(s for s, _ in cells), sum(o for _, o in cells), a)
+    rng, n, rates = random.Random(seed), len(cells), []
+    for _ in range(reps):
+        k = o = 0
+        for _ in range(n):
+            s_, o_ = cells[rng.randrange(n)]
+            k += s_
+            o += o_
+        rates.append(k / o)
+    rates.sort()
+    return (round(rates[int(a / 2 * reps)], 4), round(rates[min(reps - 1, int((1 - a / 2) * reps))], 4))
 
 
 def summarize(results):
@@ -150,11 +210,21 @@ def summarize(results):
     stale = sum(r["stale_edits"] for r in results)
     classes = Counter(s["class"] for r in results for s in r["stale"])
     lo, hi = cp_ci(stale, opps) if opps else (None, None)
+    clo, chi = cluster_ci(results) if opps else (None, None)
     cov = Counter()
+    oracle = Counter()
     for r in results:
         cov.update(r.get("coverage") or {})
-    return {"trajectories": len(results), "opportunities": opps, "stale_edits": stale,
-            "stale_rate": round(stale / opps, 4) if opps else None, "ci95": [lo, hi],
+        oracle.update(r.get("harness_oracle") or {})
+    writers = Counter(s.get("writer", "self") for r in results for s in r["stale"])
+    sessions = len({session_key(r) for r in results})
+    return {"trajectories": len(results), "sessions": sessions, "opportunities": opps, "stale_edits": stale,
+            "stale_rate": round(stale / opps, 4) if opps else None, "ci95": [clo, chi], "ci95_binomial": [lo, hi],
+            "ci95_method": "bootstrap over sessions" if sessions >= MIN_CLUSTERS else "binomial (too few sessions to resample)",
+            "stale_after_own_writes": writers["self"], "stale_after_other_writes": writers["other"],
+            "stale_rate_other_writes": round(writers["other"] / opps, 4) if opps else None,
+            "caught_by_harness": classes.get("CAUGHT-BY-HARNESS", 0),
+            "harness_oracle": dict(oracle),
             "went_wrong": sum(v for k, v in classes.items() if k.startswith("MATERIALIZED")),
             "classes": dict(classes.most_common()),
             "view_channels": dict(Counter(s["view_channel"] for r in results for s in r["stale"])),

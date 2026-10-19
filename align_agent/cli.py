@@ -8,7 +8,7 @@ import sys
 import time
 
 from . import __version__
-from .core import FORMATS, analyze, load, summarize
+from .core import FORMATS, analyze, load, session_key, summarize
 from .run import add_parser as add_run
 
 EXAMPLES = os.path.join(os.path.dirname(os.path.abspath(__file__)), "examples")
@@ -71,11 +71,18 @@ def _where(results, roots, top):
 
     def line(name, stale, opps):
         return f"  {stale:5d} of {opps:5d} edits ({100 * stale / opps:3.0f}%)  {name[-70:]}"
-    folders = {}
+
+    def folder(r):
+        # a Claude Code session lives in its project folder (with its subagents under <session>/), whatever
+        # root was given; other formats group by the first folder under the root
+        if r.get("format") == "claudecode":
+            return os.path.basename(os.path.dirname(session_key(r)))
+        return rel(r["file"]).split(os.sep)[0]
+    folders, sessions = {}, {}
     for r in rows:
-        key = rel(r["file"]).split(os.sep)[0]
-        s, o = folders.get(key, (0, 0))
-        folders[key] = (s + r["stale_edits"], o + r["opportunities"])
+        for d, key in ((folders, folder(r)), (sessions, session_key(r))):
+            s, o = d.get(key, (0, 0))
+            d[key] = (s + r["stale_edits"], o + r["opportunities"])
     per_file = sorted(rows, key=lambda r: -r["stale_edits"])
     total = sum(r["stale_edits"] for r in rows)
     held = sum(r["stale_edits"] for r in per_file[:10])
@@ -83,8 +90,9 @@ def _where(results, roots, top):
            + (f"; the 10 files with most hold {100 * held / total:.0f}% of the stale edits." if total else "."),
            f"Folders with most stale edits (folder names are printed here only, not in the summary line above):"]
     out += [line(k, s, o) for k, (s, o) in sorted(folders.items(), key=lambda kv: -kv[1][0])[:top] if s]
-    out += ["Files (sessions) with most stale edits:"]
-    out += [line(rel(r["file"]), r["stale_edits"], r["opportunities"]) for r in per_file[:top] if r["stale_edits"]]
+    out += ["Sessions with most stale edits (each with its subagents):"]
+    out += [line(rel(k), s, o)
+            for k, (s, o) in sorted(sessions.items(), key=lambda kv: -kv[1][0])[:top] if s]
     return out
 
 
@@ -115,10 +123,14 @@ def cmd_analyze(args):
     summary = summarize(results)
     summary["seconds"] = round(time.time() - t0, 2)
     summary["skipped"] = len(skipped)
-    print(f"\n{summary['trajectories']} trajectories, {summary['opportunities']} anchored edits to viewed files, "
-          f"{summary['stale_edits']} stale ({_pct(summary['stale_rate'])}, 95% CI {_pct(summary['ci95'][0])}-{_pct(summary['ci95'][1])}), "
-          f"{summary['went_wrong']} went wrong because of it. Views behind stale edits: {summary['view_channels']}. "
-          f"{summary['seconds']}s.")
+    print(f"\n{summary['trajectories']} transcripts in {summary['sessions']} sessions, {summary['opportunities']} anchored edits to viewed files, "
+          f"{summary['stale_edits']} stale ({_pct(summary['stale_rate'])}, 95% CI {_pct(summary['ci95'][0])}-{_pct(summary['ci95'][1])}"
+          f"{' by session' if summary['ci95_method'].startswith('bootstrap') else ''}): "
+          f"{summary['stale_after_own_writes']} after the agent's own unread writes, "
+          f"{summary['stale_after_other_writes']} after writes it did not make. "
+          f"{summary['went_wrong']} went wrong because of it"
+          + (f", {summary['caught_by_harness']} caught by Claude Code before they applied" if summary["caught_by_harness"] else "")
+          + f". Views behind stale edits: {summary['view_channels']}. {summary['seconds']}s.")
     for ln in _where(results, args.paths, args.top):
         print(ln)
     if skipped:

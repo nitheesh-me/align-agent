@@ -214,14 +214,21 @@ def _step(ops, action, obs, rc, cwd, tool, unit, conv, ts=None, thought=""):
             "tok_a": tok(action), "tok_o": tok(obs), "ts": ts}
 
 
+OTHER_WRITERS = ("sidechain:", "subagent:", "parent:", "peer:")
+
+
 def unseen(ops, who):
-    """Another agent's writes, as the session sees them: changes to files it did not watch happen."""
+    """Another agent's writes, as the session sees them: changes to files it did not watch happen.
+    An anchored edit keeps its anchor (old and new text), so the classifier can compare texts; its
+    kind becomes `foreign`, which the replay applies as a write but never scores as the session's edit."""
     out = []
     for o in ops:
         if o["op"] != "W" or o.get("landed") is False:
             continue
         if o["kind"] in ("restore", "delete", "touch"):
             out.append(dict(o, mech=f"{who}:{o.get('mech')}"))
+        elif o["kind"] == "anchored" and o.get("anchor"):
+            out.append(dict(o, kind="foreign", mech=f"{who}:{o.get('mech')}"))
         else:
             out.append({"op": "W", "path": o["path"], "kind": "replace", "mech": f"{who}:{o.get('mech')}",
                         "landed": o.get("landed"), "ev": o.get("ev"), "cmd_i": o.get("cmd_i", 0),
@@ -316,6 +323,7 @@ def patch_ops(body, cwd):
     return ops
 
 
+PATCH_CONTENT_BAD = re.compile(r"Failed to find (?:expected lines|context)|verification failed")
 PATCH_OK = re.compile(r"^Success\.|Updated the following files|^Done!", re.M)
 PATCH_BAD = re.compile(r"verification failed|Failed to find|[Ii]nvalid patch|[Ii]nvalid hunk|error:|No such file|rejected|"
                        r"patch rejected|Failed to (?:read|write|apply)")
@@ -330,8 +338,10 @@ def patch_outcome(ops, obs, success=None):
         landed, ev = True, "apply_patch reported success"
     else:
         landed, ev = None, "apply_patch result unclear"
+    # a patch whose context lines were not in the file ran against the agent's view and failed: scored
+    content_failure = landed is False and bool(PATCH_CONTENT_BAD.search(obs or ""))
     for o in ops:
-        o["ran"] = landed is not False
+        o["ran"] = landed is not False or content_failure
         o["landed"], o["ev"] = landed, ev
         if landed is False:
             o["ev"] = "patch failed: " + ev
@@ -358,9 +368,20 @@ def shell_patch(script, cwd):
 
 # ------------------------------------------------------------------ Claude Code
 
-NOT_RUN = re.compile(r"<tool_use_error>|tool use was rejected|doesn't want to proceed|Permission to use \S+ (?:has been )?denied|"
+NOT_RUN = re.compile(r"tool use was rejected|doesn't want to proceed|Permission to use \S+ (?:has been )?denied|"
                      r"[Bb]locked by (?:a )?hook|PreToolUse:\S* hook (?:error|blocking)|Interrupted by user|Request interrupted")
 CC_EXIT = re.compile(r"^Exit code (-?\d+)")
+# Claude Code wraps every refused call in <tool_use_error>. For an edit, a refusal about the file's text
+# (anchor missing or ambiguous, file changed since read) means the edit ran against a view: it is kept as
+# a failed edit and scored. Any other refusal (input validation, a cancelled parallel call) did not run.
+TOOL_USE_ERROR = "<tool_use_error>"
+EDIT_REJECTED = re.compile(r"String to replace not found|not found in file|Found \d+ matches of the string to replace|"
+                           r"modified since read")
+# Claude Code's own staleness signals: a refusal, or a note on an edit that applied anyway
+CC_STALE_REFUSED = re.compile(r"modified since read")
+CC_STALE_NOTED = re.compile(r"modified on disk since you last read it")
+CC_EDIT_OK = re.compile(r"has been updated successfully|All occurrences were successfully replaced")
+CC_BG_ID = re.compile(r"running in background with ID: ([\w-]+)")
 
 
 def _cc_edit_ev(text):
@@ -380,9 +401,12 @@ def _cc_ops(call, cwd, known, cov):
     """Ops of one Claude Code tool call with its result."""
     name, inp = call["name"], call["input"] if isinstance(call["input"], dict) else {}
     res, err, tur = call.get("result"), call.get("is_error"), call.get("tur")
-    if res is not None and err and NOT_RUN.search(res[:2000]):
-        cov["call_not_run"] += 1
-        return []
+    if res is not None and err:
+        head = res[:2000]
+        content_refusal = name in ("Edit", "MultiEdit") and EDIT_REJECTED.search(head)
+        if NOT_RUN.search(head) or (TOOL_USE_ERROR in head and not content_refusal):
+            cov["call_not_run"] += 1
+            return []
     path = inp.get("file_path") or inp.get("notebook_path")
     p = sp.resolve(os.path.expanduser(path), cwd) if isinstance(path, str) and path else None
     if name == "Bash":
@@ -432,13 +456,23 @@ def _cc_ops(call, cwd, known, cov):
             landed, ev = False, _cc_edit_ev(res)
         else:
             landed, ev = True, "editor confirmed"
+        harness = None
+        if landed is False and CC_STALE_REFUSED.search(res or ""):
+            harness = "refused-stale"
+        elif landed and CC_STALE_NOTED.search(res or ""):
+            harness = "noted-stale"
         ops = [{"op": "W", "path": p, "kind": "anchored", "mech": "editor",
                 "anchor": {"type": "str_replace", "old": e.get("old_string"), "new": e.get("new_string") or "",
                            "all": bool(e.get("replace_all"))},
-                "landed": landed, "ev": ev, "cmd_i": 0, "verb": name} for e in edits]
+                "landed": landed, "ev": ev, "cmd_i": 0, "verb": name, **({"harness": harness} if harness else {})}
+               for e in edits]
         # Claude Code shows a snippet of the edited file (older versions) or states that the model's copy
         # is current (newer ones; when other changes were on disk it says so instead): an editor echo.
-        if landed and ("result of running `cat -n`" in (res or "") or "file state is current in your context" in (res or "")):
+        # It refuses an edit to a file changed since it was read, so a plain success (the only answer of
+        # versions before the "file state is current" suffix) also means the model's copy is current.
+        if landed and harness is None and ("result of running `cat -n`" in (res or "")
+                                           or "file state is current in your context" in (res or "")
+                                           or CC_EDIT_OK.search(res or "")):
             ops.append({"op": "R", "path": p, "kind": "echo", "mech": "editor-echo", "view": {"numbered": True},
                         "landed": True, "cmd_i": 0, "verb": name})
         return ops
@@ -466,7 +500,7 @@ def _cc_ops(call, cwd, known, cov):
 
 def _cc_read(path, cwd_arg, cov, prefix=""):
     """One pass over a Claude Code transcript: (calls and notices in order, session meta)."""
-    items, by_id = [], {}
+    items, by_id, bg = [], {}, {}
     meta = {"cwd": None, "models": Counter(), "session": None}
     own_side, conv, compacting = None, 0, False
     for d, bad in records(path):
@@ -494,7 +528,9 @@ def _cc_read(path, cwd_arg, cov, prefix=""):
                     continue
                 c = {"kind": "call", "name": b.get("name"), "input": b.get("input"), "id": b.get("id"), "unit": unit,
                      "conv": conv, "cwd": cwd, "ts": d.get("timestamp"), "side": side != own_side, "thought": thought,
-                     "result": None, "is_error": None, "tur": None, "ts_done": None, "extra": ""}
+                     "result": None, "is_error": None, "tur": None, "ts_done": None, "extra": "",
+                     "bg": b.get("name") == "Bash" and isinstance(b.get("input"), dict)
+                     and bool(b["input"].get("run_in_background")), "bg_done": False}
                 cov[f"{prefix}tool:{c['name']}"] += 1
                 items.append(c)
                 if c["id"]:
@@ -504,6 +540,14 @@ def _cc_read(path, cwd_arg, cov, prefix=""):
             if d.get("isCompactSummary") and not compacting:
                 conv += 1
             content = m.get("content")
+            if bg and "<task-notification>" in _text(content):
+                # a background command finished: its writes land now, not when it was launched
+                for tid in re.findall(r"<task-id>([\w-]+)</task-id>", _text(content)):
+                    c = bg.pop(tid, None)
+                    if c is not None:
+                        c["bg_done"] = True
+                        items.append({"kind": "bgdone", "call": c, "conv": conv, "ts": d.get("timestamp"), "cwd": cwd})
+                        cov[f"{prefix}background_completed"] += 1
             results = [b for b in content if isinstance(b, dict) and b.get("type") == "tool_result"] \
                 if isinstance(content, list) else []
             for b in results:
@@ -512,6 +556,10 @@ def _cc_read(path, cwd_arg, cov, prefix=""):
                     cov[f"{prefix}result_without_call"] += 1
                     continue
                 c["result"], c["is_error"], c["ts_done"] = _text(b.get("content")), bool(b.get("is_error")), d.get("timestamp")
+                if c.get("bg") and not c["is_error"]:
+                    m_bg = CC_BG_ID.search(c["result"] or "")
+                    if m_bg:
+                        bg[m_bg.group(1)] = c
                 tur = d.get("toolUseResult")
                 if len(results) == 1 and isinstance(tur, dict):
                     keep = ("file", "interrupted", "type")
@@ -547,6 +595,14 @@ def _cc_steps(items, cwd_arg, cov, prefix=""):
     """Steps in order; notices and sidechain steps wait for the end of the unit they arrive in."""
     steps, known, held, cur = [], {}, [], None
     for k, it in enumerate(items):
+        if it["kind"] == "bgdone":
+            c = it["call"]
+            w = c.pop("bg_writes", None)
+            if w:
+                w = [dict(o, no_score=True, no_apply=False) for o in w]
+                held.append(_step(unseen(w, "sidechain") if c["side"] else w, c["input"].get("command") or "", "", None,
+                                  cwd_arg or c["cwd"], "sidechain" if c["side"] else "shell-bg", ("b", k), it["conv"], it["ts"]))
+            continue
         if it["kind"] == "notice":
             p = sp.resolve(it["path"], cwd_arg or it["cwd"])
             ops = [] if it["side"] else [{"op": "R", "path": p, "kind": "full" if it["type"] == "file" else "lines",
@@ -561,6 +617,15 @@ def _cc_steps(items, cwd_arg, cov, prefix=""):
         cwd = cwd_arg or it["cwd"]
         ops = _cc_ops(it, cwd, known, cov)
         name, inp = it["name"], it["input"]
+        if it.get("bg") and ops:
+            # a background command's output goes to a file, not to the model: no views. Its writes land when
+            # it completes; without a completion on record they stay at launch, marked as of unknown landing
+            writes = [o for o in ops if o["op"] == "W"]
+            if it.get("bg_done"):
+                # scored here, where the agent composed them; applied at the completion
+                it["bg_writes"], ops = writes, [dict(o, no_apply=True) for o in writes]
+            else:
+                ops = [dict(o, landed=None, ev="background command; completion not on record", bg=True) for o in writes]
         action = inp.get("command") if name == "Bash" and isinstance(inp, dict) else \
             f"{name} {json.dumps(inp, ensure_ascii=False)[:2000]}"
         obs = (it["result"] or "") + it["extra"]
@@ -572,32 +637,79 @@ def _cc_steps(items, cwd_arg, cov, prefix=""):
         steps.append(_step(ops, action or "", obs, it.get("rc"), cwd, name if name != "Bash" else "shell",
                            it["unit"], it["conv"], it["ts"], it["thought"]))
         steps[-1]["ts_done"] = it["ts_done"]
-    return steps + held
+    steps += held
+    _drop_unlanded_background(steps, cov, prefix)
+    return steps
+
+
+def _drop_unlanded_background(steps, cov, prefix=""):
+    """A background write with no completion on record had not landed when a later edit of the same file
+    came back with the model's copy current (Claude Code refuses or notes an edit to a file changed since
+    it was read): it is still scored where it was composed, but not applied at launch."""
+    for i, s in enumerate(steps):
+        for o in [o for o in s["ops"] if o.get("bg")]:
+            for s2 in steps[i + 1:]:
+                if any(e["op"] == "R" and e.get("kind") == "echo" and e["path"] == o["path"] for e in s2["ops"]):
+                    o["no_apply"] = True
+                    cov[f"{prefix}background_write_not_landed"] += 1
+                    break
+
+
+def session_file(path):
+    """The main transcript of the session a Claude Code transcript belongs to: itself, or for
+    <session>/subagents/[...]/agent-x.jsonl, <session>.jsonl."""
+    parts = os.path.normpath(path).split(os.sep)
+    if "subagents" in parts[:-1]:
+        i = len(parts) - 1 - parts[::-1].index("subagents")
+        return os.sep.join(parts[:i]) + ".jsonl"
+    return path
+
+
+_WRITE_CACHE = {}
+
+
+def _write_steps(path, cwd, who, tag):
+    """Another transcript's own writes, as steps for merge(); cached per process (one session's
+    transcripts are read once each however many of its subagents are analyzed)."""
+    try:
+        key = (path, cwd, os.path.getmtime(path))
+    except OSError:
+        return []
+    if key not in _WRITE_CACHE:
+        if len(_WRITE_CACHE) > 64:
+            _WRITE_CACHE.clear()
+        sitems, _ = _cc_read(path, cwd, Counter())
+        _WRITE_CACHE[key] = [s for s in _cc_steps(sitems, cwd, Counter()) if s["tool"] not in ("notice", "sidechain")]
+    out = []
+    for s in _WRITE_CACHE[key]:
+        w = unseen(s["ops"], who)
+        if w:
+            out.append(_step(w, s["action"], "", s["rc"], s["cwd"], who, ("a", tag, s["unit"]), 0, s.get("ts_done") or s["ts"]))
+    return out
 
 
 def adapt_claudecode(path, cwd=None):
-    """(steps, meta, coverage) for one Claude Code transcript and the subagent transcripts beside it."""
+    """(steps, meta, coverage) for one Claude Code transcript and the transcripts that share its
+    workspace: a session's subagents, or for a subagent, its session and sibling subagents."""
     cov = Counter()
     items, meta = _cc_read(path, cwd, cov)
     steps = _cc_steps(items, cwd, cov)
-    subdir = os.path.join(os.path.splitext(path)[0], "subagents")
+    main = session_file(path)
+    subdir = os.path.join(os.path.splitext(main)[0], "subagents")
     others = []
+    if main != path and os.path.isfile(main):
+        others += _write_steps(main, cwd, "parent", "parent")
+        cov["parent_write_steps"] += len(others)
     if os.path.isdir(subdir):
         for root, _, names in sorted(os.walk(subdir)):
             for n in sorted(names):
-                if not n.endswith(".jsonl"):
+                f = os.path.join(root, n)
+                if not n.endswith(".jsonl") or os.path.abspath(f) == os.path.abspath(path):
                     continue
-                sc = Counter()
-                sitems, _ = _cc_read(os.path.join(root, n), cwd, sc)
-                for s in _cc_steps(sitems, cwd, sc):
-                    if s["tool"] == "notice":
-                        continue
-                    w = unseen(s["ops"], "subagent")
-                    if w:
-                        others.append(_step(w, s["action"], "", s["rc"], s["cwd"], "subagent", ("a", n, s["unit"]), 0,
-                                            s.get("ts_done") or s["ts"]))
-                cov["subagent_transcripts"] += 1
-                cov["subagent_write_steps"] += sum(1 for s in others if s["unit"][1] == n)
+                w = _write_steps(f, cwd, "subagent" if main == path else "peer", n)
+                others += w
+                cov["subagent_transcripts" if main == path else "sibling_transcripts"] += 1
+                cov["subagent_write_steps" if main == path else "sibling_write_steps"] += len(w)
     if others:
         steps = merge(steps, others)
     meta["model"] = meta["models"].most_common(1)[0][0] if meta["models"] else ""

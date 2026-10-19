@@ -463,6 +463,10 @@ _PY_ASSIGN = re.compile(r"""(?P<v>\b[A-Za-z_]\w*)\s*=\s*(?:(?:pathlib\.)?Path\(\
 _PY_PATHWRITE = re.compile(r"""(?:(?:pathlib\.)?Path\(\s*(?P<lit>[rbfu]?(['"])[^'"\n]+\2)\s*\)|(?P<v>\b[A-Za-z_]\w*))\s*\.write_(?:text|bytes)\(""")
 _PY_PATHREAD = re.compile(r"""(?:(?:pathlib\.)?Path\(\s*(?P<lit>[rbfu]?(['"])[^'"\n]+\2)\s*\)|(?P<v>\b[A-Za-z_]\w*))\s*\.read_(?:text|bytes)\(""")
 _PY_LINEOPS = re.compile(r"\w*lines\[\s*[\w+\- ]+\]\s*=|\.insert\(\s*[\w+\- ]+,|del\s+\w+\[|\w+\[\s*\d+\s*:\s*\d+\s*\]|splitlines\(\)\[")
+# line operations that change lines (assign, insert, delete, slice-assign); indexing or slicing alone only reads
+_PY_LINEEDIT = re.compile(r"\w*lines\[\s*[\w+\- ]+\]\s*=(?!=)|\.insert\(\s*[\w+\- ]+,|del\s+\w+\[|\w+\[[^\]\n]*:[^\]\n]*\]\s*=(?!=)")
+# text spliced around a found position: s[:i] + new + s[j:]
+_PY_SPLICE = re.compile(r"\w+\[\s*:\s*[\w.()+\- ]+\]\s*\+")
 _PY_FIND = re.compile(r"\.(?:find|index|rfind|rindex|startswith|count)\(\s*(" + _PY_STR + r")|(" + _PY_STR + r")\s+(?:not\s+)?in\s+\w+")
 
 
@@ -549,6 +553,8 @@ def python_script_ops(script: str, cwd: str, strict: bool = False) -> Tuple[List
         if m.group(1) in compiled:
             regex.append({"pat": compiled[m.group(1)], "rep": py_literal(m.group(2)) if m.group(2) else None})
     line_ops = bool(_PY_LINEOPS.search(script))
+    line_edit = bool(_PY_LINEEDIT.search(script))
+    splice = bool(_PY_SPLICE.search(script))
     finds = []
     for m in _PY_FIND.finditer(script):
         lit = py_literal(m.group(1) or m.group(2) or "")
@@ -565,7 +571,9 @@ def python_script_ops(script: str, cwd: str, strict: bool = False) -> Tuple[List
         if append:
             ops.append({"op": "W", "path": ap, "kind": "append", "mech": "python",
                         "anchor": None, "write_line": first_write_line})
-        elif self_read and (replaces or regex or (not strict and (line_ops or finds))):
+        elif self_read and (replaces or regex or (not strict and (line_edit or (finds and splice)))):
+            # anchored: a literal substitution, a line edit, or text spliced at a found position. A script
+            # that only tests for a literal (`if 'x' in s`) or slices to read, then writes, is a rewrite
             ops.append({"op": "W", "path": ap, "kind": "anchored", "mech": "python",
                         "anchor": {"type": "py", "replaces": replaces, "regex": regex, "finds": finds[:20],
                                    "line_ops": line_ops, "reads_self": True},
@@ -579,6 +587,40 @@ def python_script_ops(script: str, cwd: str, strict: bool = False) -> Tuple[List
             ops.append({"op": "W", "path": ap, "kind": "overwrite_unseen", "mech": "python",
                         "anchor": None, "write_line": first_write_line})
     return ops, sorted(read_set)
+
+
+_PY_READEXPR = r"(?:open\(\s*(?P<a{n}>[^,)]+?)\s*(?:,\s*[rbfu]?['\"]r?t?['\"])?\s*\)\.read\(\)|(?:(?:pathlib\.)?Path\(\s*(?P<l{n}>" + _PY_STR + r")\s*\)|(?P<v{n}>\b[A-Za-z_]\w*))\.read_text\(\))"
+_PY_PRINT_READ = re.compile(r"(?:\bprint|sys\.stdout\.write)\(\s*" + _PY_READEXPR.replace("{n}", "1") + r"\s*[,)]")
+_PY_VAR_READ = re.compile(r"(?P<var>\b[A-Za-z_]\w*)\s*=\s*" + _PY_READEXPR.replace("{n}", "2") + r"\s*$", re.M)
+
+
+def python_printed(script: str, cwd: str) -> List[str]:
+    """Files whose whole text a Python script prints unchanged: print(open(p).read()),
+    print(Path(p).read_text()), or s = open(p).read() ... print(s) with s never reassigned."""
+    if not script or "print" not in script and "stdout" not in script:
+        return []
+    names: Dict[str, str] = {}
+    for m in _PY_ASSIGN.finditer(script):
+        lit = py_literal(m.group("s"))
+        if lit:
+            names[m.group("v")] = lit
+
+    def target(m, n):
+        a, lit, v = m.group(f"a{n}"), m.group(f"l{n}"), m.group(f"v{n}")
+        if a is not None:
+            a = a.strip()
+            return py_literal(a) if py_literal(a) is not None else names.get(a)
+        if lit is not None:
+            return py_literal(lit)
+        return names.get(v or "")
+
+    out = [target(m, 1) for m in _PY_PRINT_READ.finditer(script)]
+    for m in _PY_VAR_READ.finditer(script):
+        var = m.group("var")
+        if len(re.findall(r"\b" + re.escape(var) + r"\s*(?:[+\-*]?=)(?!=)", script)) == 1 \
+                and re.search(r"(?:\bprint|sys\.stdout\.write)\(\s*" + re.escape(var) + r"\s*[,)]", script):
+            out.append(target(m, 2))
+    return [resolve(p, cwd) for p in dict.fromkeys(out) if p and path_like(p)]
 
 
 # --- patches ---------------------------------------------------------------
@@ -928,6 +970,13 @@ def extract(cmd: str, cwd: str, known_files: Optional[Dict[str, str]] = None,
                 for o in w:
                     o["script_src"] = src
                 new_ops.extend(w)
+                if not swallowed:
+                    # a file the script prints whole, without writing it, reaches the agent like `cat`
+                    written = {o["path"] for o in w}
+                    for f in python_printed(script, cwd):
+                        if f not in written:
+                            new_ops.append({"op": "R", "path": f, "kind": "lines" if filtered(u) else "full",
+                                            "mech": "python-print", "view": {}})
         elif verb in ("cp", "mv", "install"):
             targets = [a for a in operands if path_like(a)]
             if len(targets) >= 2:

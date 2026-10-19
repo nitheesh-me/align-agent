@@ -168,7 +168,7 @@ class Replay:
                         continue
                     if o["kind"] == "anchored" and o.get("ran") is False:
                         self.not_executed.append({"step": s["i"], "op": oi, "path": o["path"], "ev": o.get("ev")})
-                    elif o["kind"] == "anchored":
+                    elif o["kind"] == "anchored" and not o.get("no_score"):
                         if k not in scored:
                             scored.add(k)
                             if k in held:
@@ -189,8 +189,8 @@ class Replay:
                             self.intra.append({"step": s["i"], "op": oi, "path": o["path"], "conv": conv, "unit": unit,
                                                "bench": s.get("bench"), "landed": landed, "mech": o.get("mech"),
                                                "prior_same_unit_writes": prior})
-                    if not lands:
-                        continue
+                    if not lands or o.get("no_apply"):
+                        continue  # no_apply: scored where it was composed, applied later (a background command)
                     before = self.cid(k)
                     kind = o["kind"]
                     if kind == "restore":

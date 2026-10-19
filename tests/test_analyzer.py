@@ -242,7 +242,7 @@ class Analyzer(unittest.TestCase):
             self.assertEqual(len(sessions), 1)
             self.assertIn("sess1.jsonl", sessions[0])
 
-    def test_codex_failed_patch_is_scored(self):
+    def codex_failed_patch(self):
         lines = [{"type": "session_meta", "payload": {"id": "c1", "cwd": CWD}},
                  {"type": "turn_context", "payload": {"cwd": CWD, "model": "gpt"}}]
 
@@ -260,9 +260,27 @@ class Analyzer(unittest.TestCase):
         p = self.path("cx.jsonl")
         with open(p, "w") as f:
             f.writelines(json.dumps(x) + "\n" for x in lines)
-        _, r = run(p)
+        return run(p)[1]
+
+    def test_codex_failed_patch_is_scored(self):
+        r = self.codex_failed_patch()
         self.assertEqual(r["opportunities"], 2)
         self.assertEqual(r["stale_edits"], 1)
+
+    def test_anchor_is_not_found_inside_a_longer_token(self):
+        # the patch's `x = 1` was removed by the agent's own `x = 10` patch: `x = 1` is not in `x = 10`
+        r = self.codex_failed_patch()
+        self.assertEqual(r["stale"][0]["class"], "FAILED-OWN-WRITE")
+
+    def test_windows_session_paths_are_made_relative(self):
+        from align_agent.sessions import root_of
+        steps = [{"ops": [{"path": p} for p in ("C:\\Users\\Me\\proj\\src\\a.py", "c:/users/me/proj/b.py",
+                                                  "/c/Users/Me/proj/c.py", "src\\d.py", "D:\\other\\e.py")]}]
+        self.assertEqual(root_of(steps, "C:\\Users\\Me\\proj"), "C:/Users/Me/proj")
+        self.assertEqual([o["path"] for o in steps[0]["ops"]], ["src/a.py", "b.py", "c.py", "src/d.py", "D:/other/e.py"])
+        posix = [{"ops": [{"path": "/home/u/p/a.py"}, {"path": "/home/u/px/a.py"}]}]
+        root_of(posix, "/home/u/p/")
+        self.assertEqual([o["path"] for o in posix[0]["ops"]], ["a.py", "/home/u/px/a.py"])
 
 
 if __name__ == "__main__":

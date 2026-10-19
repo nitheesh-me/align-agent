@@ -135,12 +135,25 @@ def strip_numbers(text):
     return "\n".join(out)
 
 
+def _within(hay, needle):
+    """`needle` occurs in `hay` as whole tokens: `x = 1` is not in `x = 10`, nor `foo` in `foobar`."""
+    k = hay.find(needle)
+    while k != -1:
+        before = hay[k - 1] if k else ""
+        after = hay[k + len(needle)] if k + len(needle) < len(hay) else ""
+        if not (needle[0].isalnum() or needle[0] == "_") or not (before.isalnum() or before == "_"):
+            if not (needle[-1].isalnum() or needle[-1] == "_") or not (after.isalnum() or after == "_"):
+                return True
+        k = hay.find(needle, k + 1)
+    return False
+
+
 def contains(hay, needle):
     if not needle or not hay:
         return False
-    if needle in hay:
+    if _within(hay, needle):
         return True
-    return norm(needle) in norm(hay) if len(norm(needle)) >= 4 else False
+    return _within(norm(hay), norm(needle)) if len(norm(needle)) >= 4 else False
 
 
 def lines_of(s):

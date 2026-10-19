@@ -39,6 +39,7 @@ in the coverage record.
 """
 
 import json
+import ntpath
 import os
 import posixpath
 import re
@@ -1082,16 +1083,38 @@ def adapt_codex(path, cwd=None):
     return renumber(steps), meta, cov
 
 
+WIN_PATH = re.compile(r"^(?:[A-Za-z]:[\\/]|\\\\)")
+
+
+def _win_path(p):
+    """A Windows path with `/` separators: C:\\a\\b.py, C:/a/b.py and Git Bash's /c/a/b.py alike."""
+    m = re.match(r"^/([A-Za-z])(/|$)", p)
+    if m:
+        p = m.group(1).upper() + ":/" + p[3:]
+    return ntpath.normpath(p).replace("\\", "/")
+
+
 def root_of(steps, root):
-    """Strip the session's working directory from paths (extract.canonicalize, with the root the log gives)."""
+    """Strip the session's working directory from paths (extract.canonicalize, with the root the log gives).
+    A session run on Windows logs backslashed, drive-lettered paths in any case: they are compared as such."""
     if not root:
         return None
-    root = posixpath.normpath(root)
+    win = bool(WIN_PATH.match(root))
+    root = _win_path(root) if win else posixpath.normpath(root)
+    key = (lambda x: x.lower()) if win else (lambda x: x)
+
+    def rel(p):
+        if not p:
+            return p
+        p = _win_path(p) if win else p
+        if key(p) == key(root):
+            return "."
+        return p[len(root) + 1:] if key(p).startswith(key(root) + "/") else p
+
     for s in steps:
         for o in s["ops"]:
             o["abs"] = o["path"]
-            if o["path"] == root or o["path"].startswith(root + "/"):
-                o["path"] = o["path"][len(root) + 1:] or "."
-            if o.get("src") and o["src"].startswith(root + "/"):
-                o["src"] = o["src"][len(root) + 1:]
+            o["path"] = rel(o["path"])
+            if o.get("src"):
+                o["src"] = rel(o["src"])
     return root

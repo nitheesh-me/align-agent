@@ -235,6 +235,7 @@ def tail_diff_blocks(
             continue
 
         if used_chars + len(diff_text) > TAIL_DIFF_MAX_CHARS:
+            # cut at a line end, so the last line shown keeps its whole line number
             diff_text = diff_text[: TAIL_DIFF_MAX_CHARS - used_chars].rsplit("\n", 1)[0] + "\n...[truncated]"
 
         blocks.append(diff_text)

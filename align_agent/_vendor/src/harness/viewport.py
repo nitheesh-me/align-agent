@@ -53,6 +53,10 @@ VIEWPORT_MAX_LINE = 200
 VIEWPORT_MAX_CHARS = 10_000
 
 
+# never source at any depth; every other skip_dirs entry is skipped at the workspace root only
+SKIP_ANYWHERE = {".git", "__pycache__", "node_modules", ".pytest_cache", ".mypy_cache", ".tox"}
+
+
 def snapshot_workspace(workspace_dir: str, skip_dirs: Optional[set] = None) -> Dict[str, Tuple[int, int]]:
     """Map every workspace file to (mtime_ns, size).
 
@@ -65,7 +69,10 @@ def snapshot_workspace(workspace_dir: str, skip_dirs: Optional[set] = None) -> D
     skip = skip_dirs or {".git", "__pycache__", "node_modules", ".egg-info"}
     snap: Dict[str, Tuple[int, int]] = {}
     for root, dirs, files in os.walk(workspace_dir):
-        dirs[:] = [d for d in dirs if d not in skip]
+        # build/, dist/, venv/ ... are build trees at the top only: deeper, a directory
+        # with that name is source (pip's src/pip/_internal/operations/build/)
+        top = os.path.samefile(root, workspace_dir)
+        dirs[:] = [d for d in dirs if not (d in SKIP_ANYWHERE or (top and d in skip))]
         for name in files:
             full = os.path.join(root, name)
             try:

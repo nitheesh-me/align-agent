@@ -1,0 +1,4 @@
+# Shell scripts run under bash/sh even on Windows (Git Bash, WSL): keep LF so a
+# core.autocrlf checkout does not break them with `$'\r': command not found`.
+*.sh text eol=lf
+integrations/cline/* text eol=lf

@@ -16,7 +16,9 @@ a word match for it remains outside the written file.
 
 import os
 import re
+import functools
 import subprocess
+import time
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 # 2: a name other files have always defined (another type's method) is no
@@ -37,6 +39,16 @@ MIN_NAME = 3
 MAX_HITS = 40
 MAX_DEFINING = 25
 JOIN_LINES = 12
+# Seconds for all git calls of one notice: hooks are killed at about 30 s, and a
+# timed-out search must not take the rest of the write-through with it.
+TIME_BUDGET = 10.0
+_deadline = float("inf")
+
+
+def _timeout(cap: float = 20.0) -> Optional[float]:
+    """Seconds left for one git call, or None when the notice's budget is spent."""
+    left = _deadline - time.monotonic()
+    return min(cap, left) if left > 0.05 else None
 
 Key = Tuple[str, str]  # (owner, name); owner is "" at module level
 # What a declaration promises its users: ("fn", parameters, what it returns),
@@ -347,6 +359,43 @@ def _param_names(params: str) -> List[str]:
     return names
 
 
+def _compatible(params: str, new_params: str) -> bool:
+    """Whether every old call still binds: the old parameters come first, in order, and
+    each added one has a default or is variadic (`*args`, `**kw`, a bare `*`)."""
+    old, new = _param_names(params), _param_names(new_params)
+    parts = [p.strip() for p in _flat(new_params).split(",") if p.strip() and p.strip() not in ("self", "cls")]
+    if parts and all(p.startswith("*") for p in parts):
+        return True  # (*args, **kw) takes any call
+    return new[:len(old)] == old and all("=" in p or p.startswith(("*", "...")) for p in parts[len(old):])
+
+
+_PY_GUARD = re.compile(r"(?:if|elif|else|try|except|finally|with)\b")
+
+
+def _py_still_defined(text: Optional[str], name: str) -> bool:
+    """Whether Python `text` still defines module-level `name` inside an if/try/with
+    block (a version or import fallback), which the line scanner does not read."""
+    lines = (text or "").split("\n")
+    n = re.escape(name)
+    defines = re.compile(rf"(?:async\s+)?def\s+{n}\s*\(|class\s+{n}\b|{n}\s*(?::[^=]+)?=(?!=)"
+                         rf"|from\s+\S+\s+import\s+.*\b{n}\b|import\s+.*\b{n}\b")
+    for i, line in enumerate(lines):
+        ind = _indent(line)
+        if not ind or not defines.match(line.strip()):
+            continue
+        # the block opener this line sits in, all the way out to column 0
+        openers = []
+        for prev in reversed(lines[:i]):
+            if prev.strip() and not prev.lstrip().startswith("#") and _indent(prev) < ind:
+                openers.append(prev.strip())
+                ind = _indent(prev)
+                if ind == 0:
+                    break
+        if openers and all(_PY_GUARD.match(o) for o in openers):
+            return True
+    return False
+
+
 def _returns(result: str) -> int:
     """How many values a Go function returns."""
     result = result.strip()
@@ -361,12 +410,14 @@ def changes(before: Optional[str], after: Optional[str], path: str) -> List[Tupl
     different number of return values or a field's type. A rename shows up as
     the removal of the old name. Module-level names come before members."""
     old, new = scan(before, path), scan(after, path)
-    out = [(o, n, "removed") for (o, n) in old if (o, n) not in new]
+    out = [(o, n, "removed") for (o, n) in old if (o, n) not in new
+           and not (path.endswith(".py") and not o and _py_still_defined(after, n))]
     for key in old:
         if key not in new or old[key] == new[key]:
             continue
         (kind, params, result), (new_kind, new_params, new_result) = old[key], new[key]
-        if kind == new_kind == "fn" and _param_names(params) != _param_names(new_params):
+        if kind == new_kind == "fn" and _param_names(params) != _param_names(new_params) \
+                and not _compatible(params, new_params):
             out.append((*key, f"parameters ({params}) -> ({new_params})"))
         elif kind == new_kind == "fn" and _returns(result) != _returns(new_result):
             out.append((*key, f"returns {result or 'nothing'} -> {new_result or 'nothing'}"))
@@ -418,13 +469,27 @@ NOT_SEARCHED = ["patch.txt", ".materialized", "*.bak", "*.backup", "*.orig", "*.
 NOT_SEARCHED_DIRS = [".venv-task", ".cache", ".local", ".config", ".npm", "node_modules", "vendor"]
 
 
-def _git_grep(workspace: str, args: List[str]) -> List[str]:
+@functools.lru_cache(maxsize=64)
+def _in_git(workspace: str) -> bool:
     try:
-        res = subprocess.run(["git", "-C", workspace, "grep", "-I", "--untracked", *args, "--", ".",
+        return subprocess.run(["git", "-C", workspace, "rev-parse", "--is-inside-work-tree"],
+                              capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def _git_grep(workspace: str, args: List[str]) -> List[str]:
+    timeout = _timeout()
+    if timeout is None:
+        return []
+    # outside a repository git grep searches the directory itself (--no-index)
+    scope = "--untracked" if _in_git(workspace) else "--no-index"
+    try:
+        res = subprocess.run(["git", "-C", workspace, "grep", "-I", scope, *args, "--", ".",
                               *[f":(exclude,glob)**/{pat}" for pat in NOT_SEARCHED],
                               *[f":(exclude,glob){d}/**" for d in NOT_SEARCHED_DIRS],
                               *[f":(exclude,glob)**/{d}/**" for d in ("node_modules", "vendor")]],
-                             capture_output=True, text=True, timeout=20)
+                             capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return []
     return res.stdout.splitlines()
@@ -482,6 +547,8 @@ def dependency_notice(workspace: str, writes: Iterable[str], before: Dict[str, s
     `before` maps each written file to its content before this write;
     `written` is every file the agent has written in this run.
     """
+    global _deadline
+    _deadline = time.monotonic() + TIME_BUDGET
     viewed = viewed or set()
     written = set(written or ()) | set(writes)
     blocks: List[str] = []
@@ -537,9 +604,10 @@ def dependency_notice(workspace: str, writes: Iterable[str], before: Dict[str, s
             related = {p for p, _, _ in uses if os.path.dirname(p) == here or p in importers or p in owner_files}
             label = f"{owner}.{name}" if owner else name
             note = ""
-            if (owner, name) not in at_head:
+            if (owner, name) not in at_head and _in_git(workspace):
                 # The agent added this name during the run: only files it has
-                # written since can use it.
+                # written since can use it. (Outside git there is no record of
+                # what the run added.)
                 uses = [h for h in uses if h[0] in written]
             if how == "removed" and new_homes:
                 home = new_homes[0]
@@ -608,9 +676,12 @@ def _read(workspace: str, rel: str) -> Optional[str]:
 
 def committed(workspace: str, rel: str) -> Optional[str]:
     """The file as committed, the baseline for a file first written unseen."""
+    timeout = _timeout()
+    if timeout is None:
+        return None
     try:
         res = subprocess.run(["git", "-C", workspace, "show", f"HEAD:{rel}"], capture_output=True,
-                             text=True, timeout=20)
+                             text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return res.stdout if res.returncode == 0 else None

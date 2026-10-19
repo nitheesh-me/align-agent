@@ -29,6 +29,8 @@ import logging
 import os
 import re
 import shlex
+import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -545,7 +547,7 @@ class PostQodeModel(TextChatModel):
         return {"reasoning": {"effort": self._reasoning_effort}}
 
 
-SANDBOX_PROFILE_NAME = ".sandbox.sb"
+SANDBOX_PROFILE_NAME = "align-agent.sb"
 
 # Everything is readable, as in the SWE-bench image, but writes are confined
 # to the cell. Without this an agent looking for a test runner ran
@@ -560,6 +562,7 @@ SANDBOX_PROFILE = """(version 1)
   (subpath "/private/var/tmp")
   (subpath "/private/var/folders")
   (subpath "/dev"))
+(deny file-write* (subpath "{profile_dir}"))
 """
 
 
@@ -588,10 +591,16 @@ class SandboxedLocalEnvironment(LocalEnvironment):
 
 
 def write_sandbox_profile(workspace_dir: str) -> str:
-    """Write the cell's sandbox profile and return its path."""
-    path = os.path.join(workspace_dir, SANDBOX_PROFILE_NAME)
+    """Write the cell's sandbox profile and return its path.
+
+    sandbox-exec re-reads the profile for every command, so it lives outside the
+    workspace, read-only, in a directory the profile itself denies writes to (the
+    temporary directory is otherwise writable): the agent cannot loosen it."""
+    profile_dir = os.path.realpath(tempfile.mkdtemp(prefix="align-agent-sandbox-"))
+    path = os.path.join(profile_dir, SANDBOX_PROFILE_NAME)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(SANDBOX_PROFILE.format(workspace=os.path.realpath(workspace_dir)))
+        f.write(SANDBOX_PROFILE.format(workspace=os.path.realpath(workspace_dir), profile_dir=profile_dir))
+    os.chmod(path, 0o444)
     return path
 
 
@@ -882,7 +891,8 @@ class FreshnessAgent(DefaultAgent):
         if self.arm == InterventionArm.ARM_12_DEPENDENCY_WRITE_THROUGH and writes:
             before_defs = {}
             for w in writes:
-                base = before_contents.get(w) or self._dep_cache.get(w) or committed(self.workspace_dir, w)
+                base = next((b for b in (before_contents.get(w), self._dep_cache.get(w)) if b is not None), None)
+                base = base if base is not None else committed(self.workspace_dir, w)  # an empty file is a version
                 if base is not None:
                     before_defs[w] = base
             viewed = {b.file_path for b in self.instr.freshness_hook.bindings}
@@ -1013,6 +1023,9 @@ def build_agent(
             env_vars["PATH"] = venv_bin + os.pathsep + os.environ.get("PATH", "")
             env_vars["VIRTUAL_ENV"] = os.path.dirname(venv_bin)
         if sandboxed:
+            if sys.platform != "darwin":
+                raise RuntimeError("the local sandbox uses macOS sandbox-exec; pass an image, or "
+                                   "sandboxed=False inside a container")
             env = SandboxedLocalEnvironment(
                 sandbox_profile=write_sandbox_profile(workspace_dir),
                 cwd=workspace_dir,

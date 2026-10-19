@@ -42,7 +42,7 @@ ALL_PATHS = "*"
 # replay so the two canonicalize identically.
 CONTAINER_ROOTS = ("/testbed/", "/app/", "/workspace/", "/root/repo/", "/home/")
 
-_HEREDOC_OP_RE = re.compile(r"""(?<!<)<<-?(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\1""")
+_HEREDOC_OP_RE = re.compile(r"""<<(-?)(?!<)\s*(['"]?)([A-Za-z_][A-Za-z0-9_]*)\2""")
 _SEPARATORS = {";", ";;", "&&", "||", "&", "(", ")"}
 _SEPARATOR_CHARS = set("();|&\n")
 _REDIRECT_CHARS = set("<>&")
@@ -122,18 +122,49 @@ def split_heredocs(cmd: str) -> Tuple[str, List[str]]:
     lines of a second body otherwise read as commands."""
     lines = (cmd or "").split("\n")
     out, bodies, i = [], [], 0
+    quote = ""  # the quote open at the end of the previous line: `python -c "..."` spans lines
     while i < len(lines):
         line = lines[i]
         out.append(line)
         i += 1
-        for m in _HEREDOC_OP_RE.finditer(line):
-            delim, body = m.group(2), []
-            while i < len(lines) and lines[i].strip() != delim:
+        ops, quote = _heredoc_ops(line, quote)
+        for strip_tabs, delim in ops:
+            body = []
+            # bash ends a body only at a line that is exactly the delimiter (`<<-`: after tabs)
+            while i < len(lines) and (lines[i].lstrip("\t") if strip_tabs else lines[i]).rstrip("\r") != delim:
                 body.append(lines[i])
                 i += 1
             i += 1
             bodies.append("\n".join(body))
     return "\n".join(out), bodies
+
+
+def _heredoc_ops(line: str, quote: str) -> Tuple[List[Tuple[bool, str]], str]:
+    """The `<<` / `<<-` operators of one line that are outside quotes, as
+    (strips tabs, delimiter), and the quote still open at its end. A `<<`
+    inside a grep pattern or a python -c string is text, not a heredoc."""
+    ops, k = [], 0
+    while k < len(line):
+        c = line[k]
+        if quote == "'":
+            quote = "" if c == "'" else quote
+        elif c == "\\":
+            k += 1
+        elif quote == '"':
+            quote = "" if c == '"' else quote
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and (k == 0 or line[k - 1] in " \t;&|("):
+            break  # a comment
+        elif line.startswith("<<<", k):
+            k += 2
+        elif line.startswith("<<", k):
+            m = _HEREDOC_OP_RE.match(line, k)
+            if m:
+                ops.append((m.group(1) == "-", m.group(3)))
+                k = m.end() - 1
+        k += 1
+    return ops, quote
 
 
 def command_units(cmd: str) -> List[Dict]:
@@ -375,6 +406,15 @@ def _perl(argv, flags, ops, u, literal) -> Rw:
 
 def _copy(argv, flags, ops, u, literal) -> Rw:
     targets = [o for o in ops if plausible_path(clean(o))]
+    into = next((argv[k + 1] for k, a in enumerate(argv[:-1]) if a in ("-t", "--target-directory")), None) \
+        or next((a.split("=", 1)[1] for a in argv if a.startswith("--target-directory=")), None)
+    if into:  # cp -t DIR SRC...: each source lands in DIR under its own name
+        srcs = [t for t in targets if t != into]
+        kind = lambda s: f"{COPY_PREFIX}{clean(s)}"
+        writes = [(f"{into.rstrip('/')}/{clean(s).split('/')[-1]}", kind(s)) for s in srcs]
+        if argv[0].split("/")[-1] == "mv":
+            writes += [(s, "delete") for s in srcs]
+        return [], writes
     if len(targets) < 2:
         return [], []
     # One source onto one target carries the source's content; several go
@@ -414,6 +454,11 @@ def _git(argv, flags, ops, u, literal) -> Rw:
     after_dd = argv[argv.index("--") + 1:] if "--" in argv else None
     if sub == "apply":
         return [], [(p, "anchored") for p in patch_targets(u["heredoc"])]
+    if sub == "checkout" and after_dd is None and (
+            any(f in argv for f in ("-b", "-B", "--orphan", "-")) or not any(plausible_path(clean(r)) or r == "." for r in rest)):
+        # `git checkout -b feature`, `git checkout main`: a branch switch. Files it changes
+        # show up in the snapshot diff; it is not a restore of everything written.
+        return [], [(ALL_PATHS, "replace")]
     if sub in ("checkout", "restore"):
         named = after_dd if after_dd is not None else [r for r in rest if plausible_path(clean(r)) or r == "."]
         if "." in named or not named:

@@ -28,12 +28,18 @@ ARMS = {"control": "control", "viewport": "write_through_viewport", "diff": "wri
 
 
 def cmd_run(args):
+    # the key goes to the model endpoint only: LocalEnvironment runs every command with
+    # os.environ merged in (and serializes it), so the agent could otherwise print it
+    key = os.environ.pop(args.api_key_env, "") if args.api_key_env else ""
+    if not args.image and not args.no_sandbox and sys.platform != "darwin":
+        print("align-agent run: without --image, commands run under macOS sandbox-exec, which this "
+              f"system ({sys.platform}) does not have. Pass --image IMAGE, or --no-sandbox inside a container.",
+              file=sys.stderr)
+        return 2
     _vendor()
     os.environ.setdefault("MSWEA_SILENT_STARTUP", "1")
     from src.harness.arms import InterventionArm
     from src.harness.mini_real import TextChatModel, build_agent
-
-    key = os.environ.get(args.api_key_env, "") if args.api_key_env else ""
 
     class Model(TextChatModel):
         def _endpoint(self):
@@ -49,20 +55,22 @@ def cmd_run(args):
                         step_limit=args.steps, image=args.image, container_cwd=args.container_cwd,
                         sandboxed=not args.no_sandbox)
     t0 = time.time()
+    info = {"exit_status": "KeyboardInterrupt", "submission": ""}
     try:
         info = agent.run(task=task)
     except Exception as e:  # the trajectory so far is still worth keeping
         info = {"exit_status": type(e).__name__, "submission": "", "error": str(e)[:500]}
-    exit_status, result = info.get("exit_status", ""), info.get("submission", "")
-    out = {"tool": "align-agent run", "arm": ARMS[args.arm], "model": args.model, "container_workdir":
-           args.container_cwd if args.image else os.path.abspath(args.repo), "exit_status": exit_status,
-           "result": result, "seconds": round(time.time() - t0, 1), "steps": agent.step_records,
-           "messages": agent.messages}
-    with open(args.out, "w") as f:
-        json.dump(out, f, indent=1, default=str)
-    blocks = sum(1 for s in agent.step_records if s.get("writes_detected"))
-    print(f"{exit_status}: {len(agent.step_records)} steps, {blocks} with a write; trajectory in {args.out}")
-    return 0
+    finally:  # also on Ctrl-C
+        exit_status, result = info.get("exit_status", ""), info.get("submission", "")
+        out = {"tool": "align-agent run", "arm": ARMS[args.arm], "model": args.model, "container_workdir":
+               args.container_cwd if args.image else os.path.abspath(args.repo), "exit_status": exit_status,
+               "result": result, "seconds": round(time.time() - t0, 1), "steps": agent.step_records,
+               "messages": agent.messages}
+        with open(args.out, "w") as f:
+            json.dump(out, f, indent=1, default=str)
+        blocks = sum(1 for s in agent.step_records if s.get("writes_detected"))
+        print(f"{exit_status}: {len(agent.step_records)} steps, {blocks} with a write; trajectory in {args.out}")
+    return 0 if exit_status == "Submitted" else 1  # mini-swe-agent's status when the agent submits
 
 
 def add_parser(sub):

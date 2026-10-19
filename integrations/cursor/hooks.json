@@ -3,6 +3,7 @@
   "hooks": {
     "sessionStart": [{ "command": "align-agent-hook cursor" }],
     "preCompact": [{ "command": "align-agent-hook cursor" }],
+    "subagentStart": [{ "command": "align-agent-hook cursor" }],
     "beforeShellExecution": [{ "command": "align-agent-hook cursor" }],
     "beforeReadFile": [{ "command": "align-agent-hook cursor" }],
     "afterFileEdit": [{ "command": "align-agent-hook cursor" }],

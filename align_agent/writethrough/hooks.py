@@ -153,10 +153,14 @@ def cursor(p, event=None):
     event = event or p.get("hook_event_name")
     roots = p.get("workspace_roots") or []
     root = (roots[0] if roots else None) or p.get("cwd") or os.getcwd()
-    with Session(root, p.get("conversation_id") or p.get("session_id") or "cursor") as s:
-        if event in ("sessionStart", "preCompact"):
-            s.start(fresh=event == "preCompact" or p.get("source") != "resume")
-            return {}
+    key = p.get("conversation_id") or p.get("session_id") or "cursor"
+    # a subagent has its own context, so its own views: key by its id when the event carries one
+    agent = p.get("subagent_id")
+    with Session(root, re.sub(r"[^A-Za-z0-9_.-]", "_", f"{key}-{agent}" if agent else key)) as s:
+        if event in ("sessionStart", "preCompact", "subagentStart"):
+            s.start(fresh=event != "sessionStart" or p.get("source") != "resume")
+            # subagentStart is a permission hook: it must answer, or Cursor may block the subagent
+            return {"permission": "allow"} if event == "subagentStart" else {}
         if event == "beforeShellExecution":
             reason = s.before(p.get("command", ""))
             if reason:

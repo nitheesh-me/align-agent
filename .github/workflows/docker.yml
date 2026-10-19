@@ -28,14 +28,17 @@ jobs:
           if [ "$GITHUB_REF_TYPE" = tag ] && [ "v$version" != "$GITHUB_REF_NAME" ]; then
             echo "::error::tag $GITHUB_REF_NAME does not match pyproject version $version"; exit 1
           fi
+          # a manual run from a branch publishes :sha-<commit> only, never a release tag
+          if [ "$GITHUB_REF_TYPE" = tag ]; then tag="$version"; else tag="sha-${GITHUB_SHA::7}"; fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
       - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8  # v6.19.2
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |
-            ghcr.io/va24d/align-agent:${{ steps.v.outputs.version }}
+            ghcr.io/va24d/align-agent:${{ steps.v.outputs.tag }}
             ${{ github.ref_type == 'tag' && 'ghcr.io/va24d/align-agent:latest' || '' }}
           labels: |
             org.opencontainers.image.source=https://github.com/VA24d/align-agent

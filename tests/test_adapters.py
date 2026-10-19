@@ -119,6 +119,19 @@ class Cursor(Workspace):
         r = self.call(hook_event_name="postToolUse", tool_name="Delete", tool_input={"file_path": self.path()}, tool_output="")
         self.assertEqual(r, {})
 
+    def test_subagent_has_its_own_views(self):
+        self.call(hook_event_name="sessionStart")
+        self.call(hook_event_name="postToolUse", tool_name="Read", tool_input={"file_path": self.path()}, tool_output="")
+        self.assertEqual(self.call(hook_event_name="subagentStart", subagent_id="sub1"), {"permission": "allow"})
+        self.sh("sed -i 's/v5 = 5/v5 = 55/' demo.py")
+        # the subagent never read demo.py: the change is not reported to it as a diff
+        r = self.call(hook_event_name="postToolUse", subagent_id="sub1", tool_name="Shell",
+                      tool_input={"command": "true"}, tool_output="")
+        self.assertNotIn("TAIL DIFF", r.get("additional_context", ""))
+        # the parent read it: the parent is told
+        r = self.call(hook_event_name="postToolUse", tool_name="Shell", tool_input={"command": "true"}, tool_output="")
+        self.assertIn("v5 = 55", r["additional_context"])
+
     def test_read_range_and_before_read_file(self):
         self.call(hook_event_name="sessionStart")
         self.assertEqual(self.call(hook_event_name="beforeReadFile", file_path=self.path()), {"permission": "allow"})
@@ -230,6 +243,7 @@ class MCP(Workspace):
 
 
 @unittest.skipIf(os.name == "nt", "POSIX sh launcher")
+@unittest.skipIf(os.name == "nt", "POSIX sh and symlinks; Windows runs hook.sh under Git Bash in CI instead")
 class Launcher(Workspace):
     def run_hook(self, path_dirs):
         hook = os.path.join(ROOT, "claude-plugin", "scripts", "hook.sh")
@@ -258,6 +272,23 @@ class Launcher(Workspace):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn("Microsoft Store", r.stdout + r.stderr)
         self.assertTrue(os.path.isdir(os.path.join(self.dir, "state", "sessions", "l")))  # hook.py ran via `python`
+
+    def test_interpreter_is_cached_and_reprobed(self):
+        bindir = os.path.join(self.dir, "bin")
+        os.makedirs(bindir)
+        for tool in ("dirname", "cat", "uname", "mkdir"):
+            os.symlink(shutil.which(tool), os.path.join(bindir, tool))
+        os.symlink(sys.executable, os.path.join(bindir, "python3"))
+        cache = os.path.join(self.dir, "state", "python")
+        self.assertEqual(self.run_hook([bindir]).returncode, 0)
+        with open(cache) as f:
+            self.assertEqual(f.read().splitlines()[0], os.path.join(bindir, "python3"))
+        with open(cache, "w") as f:
+            f.write("/nonexistent/python3\n\n")  # uninstalled since: probe again, do not fail
+        r = self.run_hook([bindir])
+        self.assertEqual((r.returncode, r.stderr), (0, ""))
+        with open(cache) as f:
+            self.assertEqual(f.read().splitlines()[0], os.path.join(bindir, "python3"))
 
 
 if __name__ == "__main__":
